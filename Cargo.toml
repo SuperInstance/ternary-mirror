@@ -1,0 +1,7 @@
+[package]
+name = "ternary-mirror"
+version = "0.1.0"
+edition = "2021"
+description = "State mirroring for GPU cluster replication with ternary consistency. {+1=consistent, 0=lagging, -1=diverged}. Sync tracking, divergence detection, repair."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/ternary-mirror"
