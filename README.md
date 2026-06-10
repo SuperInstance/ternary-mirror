@@ -1,92 +1,70 @@
 # ternary-mirror
 
-State mirroring for GPU cluster replication with ternary consistency. {+1=consistent, 0=lagging, -1=diverged}. Sync tracking, divergence detection, repair.
+State mirroring for GPU cluster replication with ternary consistency tracking.
 
-## Why This Matters
+## Why This Exists
 
-# ternary-mirror
-State mirroring for GPU cluster replication with ternary consistency.
+When you replicate GPU state across a cluster, you need to know: is a replica consistent with the primary, lagging behind, or diverged (corrupted)? Binary consistency (consistent/inconsistent) conflates "behind but correct" with "actively wrong." Ternary consistency separates these: `Consistent` means checksum match and same version count. `Lagging` means fewer entries but everything present is correct. `Diverged` means a checksum mismatch — data corruption.
 
-## The Five-Layer Stack
+This distinction drives different repair strategies: lagging replicas just need a sync, diverged replicas need investigation.
 
-This crate is part of the **Oxide Stack** — a distributed GPU runtime built on five layers:
+## Architecture
 
-```
-┌─────────────────┐
-│  cudaclaw        │  Persistent GPU kernels, warp consensus, SmartCRDT
-├─────────────────┤
-│  cuda-oxide      │  Flux → MIR → Pliron → NVVM → PTX compiler
-├─────────────────┤
-│  flux-core       │  Bytecode VM + A2A agent protocol
-├─────────────────┤
-│  pincher         │  "Vector DB as runtime, LLM as compiler"
-├─────────────────┤
-│  open-parallel   │  Async runtime (tokio fork)
-└─────────────────┘
-```
+### Core Types
 
-The key insight: **ternary values {-1, 0, +1} map directly to GPU compute**. They pack 16× denser than FP32, enable XNOR+popcount matmul, and conservation laws become compile-time checks.
+- **`Consistency`** — Ternary enum: `Consistent (+1)`, `Lagging (0)`, `Diverged (-1)`.
+- **`MirrorEntry`** — A key-value entry with `key`, `version`, and `checksum`.
+- **`MirrorNode`** — A node (primary or replica) holding entries in a HashMap.
+- **`MirrorManager`** — Orchestrates one primary and N replicas with sync and repair.
 
-## Design
+### Consistency Logic
 
-Every value in this crate follows **ternary algebra** (Z₃):
-
-| Value | Meaning | GPU Analog |
-|-------|---------|------------|
-| +1 | Positive / Active / Healthy | Warp vote yes |
-| 0 | Neutral / Pending / Balanced | Warp vote abstain |
-| -1 | Negative / Failed / Overloaded | Warp vote no |
-
-This isn't arbitrary — ternary is the natural encoding for:
-1. **BitNet b1.58** (Microsoft) — ternary LLMs at 60% less power
-2. **GPU warp voting** — hardware ballot returns ternary consensus
-3. **Conservation laws** — {-1, 0, +1} preserves quantity
-
-## Key Types
-
-```rust
-pub enum Consistency
-pub struct MirrorEntry
-pub struct MirrorNode
-pub fn new
-pub fn put
-pub fn get
-pub fn entry_count
-pub struct MirrorManager
-pub fn new
-pub fn add_replica
-pub fn write_primary
-pub fn sync_replica
-```
+- **Consistent**: Replica has the same entry count as primary AND checksums match.
+- **Lagging**: Replica has fewer entries but all present entries match checksums.
+- **Diverged**: At least one entry has a different checksum than the primary.
 
 ## Usage
 
-```toml
-[dependencies]
-ternary-mirror = "0.1.0"
-```
-
 ```rust
-use ternary_mirror::*;
-// See src/lib.rs tests for complete working examples
+use ternary_mirror::{MirrorManager, Consistency};
+
+let mut mm = MirrorManager::new("primary");
+mm.add_replica("replica-1");
+mm.add_replica("replica-2");
+
+// Write to primary
+mm.write_primary(b"weights_layer_0".to_vec(), &[1, 0, -1, 1]);
+
+// Sync replica 0 — now consistent
+mm.sync_replica(0);
+assert_eq!(mm.consistency(0), Consistency::Consistent);
+
+// Replica 1 is still lagging
+assert_eq!(mm.consistency(1), Consistency::Lagging);
+
+// Repair all diverged replicas
+let repairs = mm.repair_all();
 ```
 
-## Testing
+## API Reference
 
-```bash
-git clone https://github.com/SuperInstance/ternary-mirror.git
-cd ternary-mirror
-cargo test    # 8 tests
-```
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `new(primary_id)` | `MirrorManager` | Create manager with a primary node |
+| `add_replica(id)` | `()` | Add a replica node |
+| `write_primary(key, data)` | `u64` | Write to primary, returns version |
+| `sync_replica(idx)` | `usize` | Copy missing/newer entries, returns count synced |
+| `consistency(idx)` | `Consistency` | Check ternary consistency of a replica |
+| `repair_all()` | `Vec<String>` | Re-sync all diverged replicas |
+| `replica_count()` | `usize` | Number of replicas |
+| `repair_count()` | `u64` | Total repairs performed |
 
-## Stats
+## The Deeper Idea
 
-| Metric | Value |
-|--------|-------|
-| Tests | 8 |
-| Lines of Rust | 196 |
-| Public API | 16 items |
+This mirrors the CAP theorem's consistency spectrum mapped to three actionable states. Rather than a binary "replica is healthy or not," you get a graduated signal: consistent replicas can serve reads, lagging replicas can serve stale reads with a warning, and diverged replicas must be taken out of rotation. This three-tier classification maps directly to read routing policies without needing external monitoring.
 
-## License
+## Related Crates
 
-Apache-2.0
+- **ternary-reassembly** — fragment reassembly with ternary completion status
+- **ternary-version** — version vectors with ternary comparison
+- **ternary-resilience** — network resilience with ternary edge weights
