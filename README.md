@@ -1,92 +1,187 @@
-# Ternary Mirror — State Mirroring for GPU Cluster Replication
+# ternary-mirror
 
-**Ternary Mirror** implements state replication across GPU cluster nodes with ternary consistency states: **+1 (Consistent)** — replica matches primary, **0 (Lagging)** — replica is behind but catchable, and **-1 (Diverged)** — replica has irreconcilable state. It provides write propagation, sync tracking, divergence detection, and automatic repair.
+State mirroring for GPU cluster replication with **ternary consistency states**: **{+1 = consistent, 0 = lagging, −1 = diverged}**. Implements primary-replica sync tracking, FNV-1a checksum-based divergence detection, and force-repair operations for maintaining state coherence across distributed GPU nodes.
 
 ## Why It Matters
 
-GPU clusters require state replication for fault tolerance and load balancing. Binary consistency models (consistent/inconsistent) lack the important middle ground: a replica that's one version behind is very different from one that's been partitioned for hours. The ternary model distinguishes these: lagging replicas can catch up with a delta sync, while divergent replicas require full repair. This enables smarter repair scheduling — fix lagging replicas immediately, schedule divergent repairs during low-load periods. For ternary inference fleets where model weights are {-1, 0, +1}, the mirror layer ensures all GPUs serve identical models.
+GPU clusters running ternary inference need replicated state for fault tolerance and load balancing. Classical replication systems (Raft, Paxos) use binary consistency: either consistent or inconsistent. The ternary model adds a crucial intermediate state:
+
+| State | Meaning | Action needed |
+|-------|---------|---------------|
+| +1 (Consistent) | Replica matches primary exactly | None |
+| 0 (Lagging) | Replica is behind but not corrupted | Sync will fix it |
+| −1 (Diverged) | Replica has conflicting data | Force repair required |
+
+This three-state distinction prevents **unnecessary repairs**: a lagging replica can catch up with an incremental sync, while a diverged replica requires a full reset. Binary systems can't distinguish these cases, leading to either excessive repairs (performance loss) or undetected corruption (correctness loss).
 
 ## How It Works
 
-### Mirror Entries
+### Replication Model
 
-Each replicated key has a `MirrorEntry` with `version` and `checksum`. The primary node is the source of truth; replicas maintain their own entry maps.
+The system uses a **primary-replica** architecture:
 
-### Write Propagation
+```
+Primary ───── write(k, v) ──► version++
+           └── sync ───────► Replicas catch up
+```
 
-When the primary writes a key:
-1. Primary updates its entry with new version + checksum
-2. Replicas are not synchronously updated (async replication)
-3. On next sync cycle, replicas pull missing/updated entries
+Each key-value pair on a node is stored as:
 
-Write to primary: O(1). Sync cycle: O(k) for k changed entries.
+```
+MirrorEntry = {
+    key: Vec<u8>,
+    version: u64,       // monotonic version number
+    checksum: u64,      // FNV-1a hash of value
+}
+```
 
 ### Consistency Classification
 
+Given primary entry P and replica entry R:
+
 ```
-Consistent: entry counts match AND all checksums match
-Lagging:    entry counts differ but sync_lag ≤ threshold (5)
-Diverged:   entry counts differ AND sync_lag > threshold
+Consistency = {
+    Consistent (+1)   if R exists ∧ R.checksum == P.checksum ∧ R.version == P.version
+    Lagging (0)       if R missing ∧ sync_lag ≤ 5
+                     ∨ R exists ∧ R.version < P.version ∧ R.checksum == P.checksum
+    Diverged (−1)     if R missing ∧ sync_lag > 5
+                     ∨ R exists ∧ R.checksum ≠ P.checksum
+}
 ```
 
-A replica is Consistent if it has the same entries with the same versions. It's Lagging if it's missing entries but the gap is small (recoverable). It's Diverged if the gap exceeds the threshold (likely needs full repair).
+**Key insight**: checksum mismatch means data corruption (divergence), while version lag means the replica hasn't synced yet (lagging). These require different responses.
 
-### Sync Operation
+### Sync Protocol
 
-`sync_replica(idx)` copies entries from primary that are newer than the replica's version. Returns count of synced entries. O(k) for k changed keys.
+Incremental sync copies only entries where the replica is behind:
 
-### Divergence Detection
+```
+sync_replica(r):
+    for each entry in primary:
+        if replica[entry.key] is None OR replica.version < entry.version:
+            replica.put(entry.key, entry.version, entry.checksum)
+            synced++
+    replica.sync_lag = 0
+```
 
-Divergence is detected when:
-1. Replica version is behind primary AND sync_lag exceeds threshold
-2. Checksum mismatch on same-version entries (data corruption)
+### Checksum: FNV-1a
 
-Divergent replicas are marked for repair — a full state copy from primary.
+The crate uses Fowler-Noll-Vo 1a for checksum computation:
 
-### Repair
+```
+h = 14695981039346656037  (FNV offset basis, 64-bit)
+for each byte b in data:
+    h = h XOR b
+    h = h × 1099511628211  (FNV prime)
+return h
+```
 
-Full repair copies all primary entries to the replica. O(n) for n entries. The `repair_count` tracks how many repairs have been performed.
+**Properties**:
+- O(n) computation, O(1) space
+- Avalanche: changing 1 bit changes ~50% of output bits
+- Non-cryptographic: fast but not collision-resistant against adversaries
+
+### Repair Protocol
+
+When a replica diverges, force-repair overwrites all entries:
+
+```
+repair(r):
+    for each entry in primary:
+        replica.put(entry.key, entry.version, entry.checksum)
+    repair_count++
+```
+
+This is O(N) where N = number of entries. The repair is conservative — it assumes all replica data may be corrupt.
+
+### Complexity
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| `write_primary(key, data)` | O(|data|) | O(1) |
+| `sync_replica(idx)` | O(E) | O(1) |
+| `consistency(idx)` | O(E) | O(1) |
+| `repair(idx)` | O(E) | O(E) |
+| `write_primary` checksum | O(|data|) | O(1) |
+
+Where E = number of entries, |data| = value size.
+
+### Sync Lag Budget
+
+The `sync_lag` counter tracks how far behind a replica has fallen. When it exceeds 5 (configurable threshold), the replica is classified as Diverged instead of Lagging. This prevents a replica from silently drifting indefinitely — if it hasn't synced after 5 missed updates, something is wrong.
 
 ## Quick Start
 
 ```rust
 use ternary_mirror::{MirrorManager, Consistency};
 
-let mut mgr = MirrorManager::new("primary");
-mgr.add_replica("replica-1");
-mgr.add_replica("replica-2");
+let mut mm = MirrorManager::new("primary");
+mm.add_replica("replica-1");
+mm.add_replica("replica-2");
 
 // Write to primary
-mgr.write_primary(b"model_weights".to_vec(), &[1, -1, 0, 1]);
+mm.write_primary(b"model_weights".to_vec(), b"binary_data_here");
+mm.write_primary(b"optimizer_state".to_vec(), b"more_data");
 
 // Sync replica 1
-let synced = mgr.sync_replica(0);
-let status = mgr.consistency(0);
-// status == Consistency::Consistent after sync
-```
+let synced = mm.sync_replica(0);
+println!("Synced {} entries to replica-1", synced);
 
-```bash
-cargo add ternary-mirror
+// Check consistency
+match mm.consistency(0) {
+    Consistency::Consistent => println!("replica-1 is consistent"),
+    Consistency::Lagging => println!("replica-1 is lagging behind"),
+    Consistency::Diverged => println!("replica-1 has diverged!"),
+}
+
+// Replica 2 hasn't synced — should be lagging
+assert_eq!(mm.consistency(1), Consistency::Lagging);
+
+// Force repair if needed
+let repaired = mm.repair(1);
+println!("Repaired {} entries on replica-2", repaired);
 ```
 
 ## API
 
-| Type / Function | Description |
-|---|---|
-| `Consistency` | `Consistent(1)`, `Lagging(0)`, `Diverged(-1)` |
-| `MirrorManager` | `new(primary_id)`, `add_replica()`, `write_primary()`, `sync_replica()`, `consistency()` |
-| `MirrorEntry` | `{ key, version, checksum }` |
+### `MirrorManager`
+
+| Method | Description |
+|--------|-------------|
+| `new(primary_id)` | Create manager with primary node |
+| `add_replica(id)` | Register a replica node |
+| `write_primary(key, data) -> u64` | Write to primary, returns new version |
+| `sync_replica(idx) -> usize` | Incremental sync, returns entry count |
+| `consistency(idx) -> Consistency` | Classify replica consistency |
+| `repair(idx) -> usize` | Force-copy all primary entries to replica |
+| `replica_count() / repairs()` | Statistics |
+
+### `Consistency`
+
+| Variant | Value | Meaning |
+|---------|-------|---------|
+| `Consistent` | +1 | Exact match with primary |
+| `Lagging` | 0 | Behind but recoverable via sync |
+| `Diverged` | −1 | Corrupt, needs force repair |
 
 ## Architecture Notes
 
-Mirror provides state replication for **SuperInstance** GPU fleets. The ternary consistency model maps to γ + η = C: consistent replicas contribute γ (reliable compute capacity), lagging replicas contribute η (entropy that resolves over time), and divergent replicas are η exceeding C (system breakdown). See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
+This crate implements the **γ (gamma) replication layer** of the γ + η = C framework:
+
+- **γ (gamma)**: State consistency management — ensuring replicas agree on cluster state. This crate provides γ-level mirror tracking with ternary consistency classification.
+- **η (eta)**: The compute workloads being replicated — model inference, tensor operations, and data pipelines running on the primary and replica nodes.
+- **C**: The complete fault-tolerant GPU cluster system. γ ensures η-layer replicas are consistent, lagging, or diverged — the ternary classification drives automated recovery decisions.
+
+The ternary consistency states {+1, 0, −1} parallel the ternary lease states and ternary marks used across the ecosystem, creating a unified three-state vocabulary for all coordination decisions.
 
 ## References
 
-- Terry, D. et al. "Managing Update Conflicts in Bayou," *SOSP*, 1995 — eventual consistency.
-- Lakshman, Avinash & Malik, Prashant. "Cassandra," *SIGMOD*, 2010 — distributed replication.
-| DeCandia, Giuseppe et al. "Dynamo," *SOSP*, 2007 — consistent hashing and replication.
+- **Primary-Backup Replication**: Budhiraja, N. et al., "Primary-Backup Protocols: Lower Bounds and Optimal Implementations," Fault-Tolerant Distributed Computing, 1993.
+- **FNV-1a Hash**: Fowler, G., Noll, L.C. & Vo, P., "Fowler/Noll/Vo Hash," IETF Draft, 2012.
+- **Eventual Consistency**: Vogels, W., "Eventually Consistent," Communications of the ACM, 52(1), 40-44, 2009.
+- **Checksum-Based Detection**: Stonebraker, M., "The Case for Shared Nothing," IEEE Database Engineering Bulletin, 9(1), 1986.
+- **CRDTs for Replication**: Shapiro, M. et al., "A Comprehensive Study of Convergent and Commutative Replicated Data Types," INRIA RR-7506, 2011.
 
 ## License
 
-Apache-2.0
+MIT
