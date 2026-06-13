@@ -1,70 +1,92 @@
-# ternary-mirror
+# Ternary Mirror — State Mirroring for GPU Cluster Replication
 
-State mirroring for GPU cluster replication with ternary consistency tracking.
+**Ternary Mirror** implements state replication across GPU cluster nodes with ternary consistency states: **+1 (Consistent)** — replica matches primary, **0 (Lagging)** — replica is behind but catchable, and **-1 (Diverged)** — replica has irreconcilable state. It provides write propagation, sync tracking, divergence detection, and automatic repair.
 
-## Why This Exists
+## Why It Matters
 
-When you replicate GPU state across a cluster, you need to know: is a replica consistent with the primary, lagging behind, or diverged (corrupted)? Binary consistency (consistent/inconsistent) conflates "behind but correct" with "actively wrong." Ternary consistency separates these: `Consistent` means checksum match and same version count. `Lagging` means fewer entries but everything present is correct. `Diverged` means a checksum mismatch — data corruption.
+GPU clusters require state replication for fault tolerance and load balancing. Binary consistency models (consistent/inconsistent) lack the important middle ground: a replica that's one version behind is very different from one that's been partitioned for hours. The ternary model distinguishes these: lagging replicas can catch up with a delta sync, while divergent replicas require full repair. This enables smarter repair scheduling — fix lagging replicas immediately, schedule divergent repairs during low-load periods. For ternary inference fleets where model weights are {-1, 0, +1}, the mirror layer ensures all GPUs serve identical models.
 
-This distinction drives different repair strategies: lagging replicas just need a sync, diverged replicas need investigation.
+## How It Works
 
-## Architecture
+### Mirror Entries
 
-### Core Types
+Each replicated key has a `MirrorEntry` with `version` and `checksum`. The primary node is the source of truth; replicas maintain their own entry maps.
 
-- **`Consistency`** — Ternary enum: `Consistent (+1)`, `Lagging (0)`, `Diverged (-1)`.
-- **`MirrorEntry`** — A key-value entry with `key`, `version`, and `checksum`.
-- **`MirrorNode`** — A node (primary or replica) holding entries in a HashMap.
-- **`MirrorManager`** — Orchestrates one primary and N replicas with sync and repair.
+### Write Propagation
 
-### Consistency Logic
+When the primary writes a key:
+1. Primary updates its entry with new version + checksum
+2. Replicas are not synchronously updated (async replication)
+3. On next sync cycle, replicas pull missing/updated entries
 
-- **Consistent**: Replica has the same entry count as primary AND checksums match.
-- **Lagging**: Replica has fewer entries but all present entries match checksums.
-- **Diverged**: At least one entry has a different checksum than the primary.
+Write to primary: O(1). Sync cycle: O(k) for k changed entries.
 
-## Usage
+### Consistency Classification
+
+```
+Consistent: entry counts match AND all checksums match
+Lagging:    entry counts differ but sync_lag ≤ threshold (5)
+Diverged:   entry counts differ AND sync_lag > threshold
+```
+
+A replica is Consistent if it has the same entries with the same versions. It's Lagging if it's missing entries but the gap is small (recoverable). It's Diverged if the gap exceeds the threshold (likely needs full repair).
+
+### Sync Operation
+
+`sync_replica(idx)` copies entries from primary that are newer than the replica's version. Returns count of synced entries. O(k) for k changed keys.
+
+### Divergence Detection
+
+Divergence is detected when:
+1. Replica version is behind primary AND sync_lag exceeds threshold
+2. Checksum mismatch on same-version entries (data corruption)
+
+Divergent replicas are marked for repair — a full state copy from primary.
+
+### Repair
+
+Full repair copies all primary entries to the replica. O(n) for n entries. The `repair_count` tracks how many repairs have been performed.
+
+## Quick Start
 
 ```rust
 use ternary_mirror::{MirrorManager, Consistency};
 
-let mut mm = MirrorManager::new("primary");
-mm.add_replica("replica-1");
-mm.add_replica("replica-2");
+let mut mgr = MirrorManager::new("primary");
+mgr.add_replica("replica-1");
+mgr.add_replica("replica-2");
 
 // Write to primary
-mm.write_primary(b"weights_layer_0".to_vec(), &[1, 0, -1, 1]);
+mgr.write_primary(b"model_weights".to_vec(), &[1, -1, 0, 1]);
 
-// Sync replica 0 — now consistent
-mm.sync_replica(0);
-assert_eq!(mm.consistency(0), Consistency::Consistent);
-
-// Replica 1 is still lagging
-assert_eq!(mm.consistency(1), Consistency::Lagging);
-
-// Repair all diverged replicas
-let repairs = mm.repair_all();
+// Sync replica 1
+let synced = mgr.sync_replica(0);
+let status = mgr.consistency(0);
+// status == Consistency::Consistent after sync
 ```
 
-## API Reference
+```bash
+cargo add ternary-mirror
+```
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `new(primary_id)` | `MirrorManager` | Create manager with a primary node |
-| `add_replica(id)` | `()` | Add a replica node |
-| `write_primary(key, data)` | `u64` | Write to primary, returns version |
-| `sync_replica(idx)` | `usize` | Copy missing/newer entries, returns count synced |
-| `consistency(idx)` | `Consistency` | Check ternary consistency of a replica |
-| `repair_all()` | `Vec<String>` | Re-sync all diverged replicas |
-| `replica_count()` | `usize` | Number of replicas |
-| `repair_count()` | `u64` | Total repairs performed |
+## API
 
-## The Deeper Idea
+| Type / Function | Description |
+|---|---|
+| `Consistency` | `Consistent(1)`, `Lagging(0)`, `Diverged(-1)` |
+| `MirrorManager` | `new(primary_id)`, `add_replica()`, `write_primary()`, `sync_replica()`, `consistency()` |
+| `MirrorEntry` | `{ key, version, checksum }` |
 
-This mirrors the CAP theorem's consistency spectrum mapped to three actionable states. Rather than a binary "replica is healthy or not," you get a graduated signal: consistent replicas can serve reads, lagging replicas can serve stale reads with a warning, and diverged replicas must be taken out of rotation. This three-tier classification maps directly to read routing policies without needing external monitoring.
+## Architecture Notes
 
-## Related Crates
+Mirror provides state replication for **SuperInstance** GPU fleets. The ternary consistency model maps to γ + η = C: consistent replicas contribute γ (reliable compute capacity), lagging replicas contribute η (entropy that resolves over time), and divergent replicas are η exceeding C (system breakdown). See [Architecture](https://github.com/SuperInstance/SuperInstance/blob/main/ARCHITECTURE.md).
 
-- **ternary-reassembly** — fragment reassembly with ternary completion status
-- **ternary-version** — version vectors with ternary comparison
-- **ternary-resilience** — network resilience with ternary edge weights
+## References
+
+- Terry, D. et al. "Managing Update Conflicts in Bayou," *SOSP*, 1995 — eventual consistency.
+- Lakshman, Avinash & Malik, Prashant. "Cassandra," *SIGMOD*, 2010 — distributed replication.
+| DeCandia, Giuseppe et al. "Dynamo," *SOSP*, 2007 — consistent hashing and replication.
+
+## License
+
+Apache-2.0
